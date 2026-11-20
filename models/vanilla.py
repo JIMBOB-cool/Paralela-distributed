@@ -83,7 +83,7 @@ class Vanilla(ContinualLearner):
                 meters["prec5"].update(prec5, x_batch.size(0))
                 meters["num_samples"].update(x_batch.size(0))
 
-    def evaluate_one_step(self, data, meters, step):
+    def evaluate_one_step(self, data, meters, step=None):
         x, y, _ = data
         x, y = x.to(self._device()), y.long().to(self._device())
 

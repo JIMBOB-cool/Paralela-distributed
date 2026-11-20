@@ -1,0 +1,11 @@
+bokeh
+filelock
+matplotlib
+nvtx
+ruamel.yaml
+six
+tensorboard
+tqdm
+pandas
+pybind11
+wandb
