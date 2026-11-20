@@ -19,6 +19,9 @@ class OptimizerRegime(Regime):
         regime,
         use_amp,
         defaults={},
+        *,
+        local_steps=1,
+        local_start_epoch=1,
     ):
         super().__init__(regime, defaults)
         self.parameters = list(model.parameters())
@@ -28,12 +31,21 @@ class OptimizerRegime(Regime):
         self.reduction = reduction
         self.gradient_predivide_factor = gradient_predivide_factor
         self.use_amp = use_amp
+        self.local_steps = local_steps
+        self.local_start_epoch = local_start_epoch
+        self.local_active = False
+        self.pending_local_steps = 0
+        self.gradient_sync_rounds = 0
+        self.weight_sync_rounds = 0
+        self.model_buffers = list(model.named_buffers()) if local_steps > 1 else []
 
         self.optimizer = None
         self.initial_state = None
 
     def create_optimizer(self, config):
         optim_method = _OPTIMIZERS[config.get("optimizer", "SGD")]
+        if self.local_steps > 1 and optim_method is not torch.optim.SGD:
+            raise ValueError("Post-local SGD requires an SGD optimizer regime")
         if not isinstance(self.optimizer, optim_method):
             self.create_distributed_optimizer(optim_method(self.parameters, lr=0))
             logging.debug(f"OPTIMIZER REGIME - setting method = {config['optimizer']}")
@@ -43,6 +55,10 @@ class OptimizerRegime(Regime):
         # Horovod: broadcast optimizer state and parameters
         hvd.broadcast_parameters(self.named_parameters, root_rank=0)
         hvd.broadcast_optimizer_state(optimizer, root_rank=0)
+
+        if self.local_steps > 1:
+            self.optimizer = optimizer
+            return
 
         # Horovod: wrap optimizer with DistributedOptimizer.
         self.optimizer = hvd.DistributedOptimizer(
@@ -96,7 +112,53 @@ class OptimizerRegime(Regime):
 
     def step(self, *args, **kwargs):
         """Performs a single optimization step (parameter update)."""
+        if self.local_steps > 1 and not self.local_active and hvd.size() > 1:
+            gradients = [p.grad for p in self.parameters if p.requires_grad]
+            if any(grad is None or grad.is_sparse for grad in gradients):
+                raise RuntimeError("Post-local SGD requires a dense gradient for each trainable parameter")
+            with torch.no_grad():
+                hvd.grouped_allreduce_(gradients, op=hvd.Average, name="post_local_gradients")
+            self.gradient_sync_rounds += 1
+
         self.optimizer.step(*args, **kwargs)
+
+        if self.local_active:
+            self.pending_local_steps += 1
+            if self.pending_local_steps == self.local_steps:
+                self.sync_pending()
+
+    def set_local_phase(self, global_epoch):
+        if self.local_steps > 1 and not self.local_active:
+            if global_epoch >= self.local_start_epoch:
+                self.local_active = True
+                if hvd.rank() == 0:
+                    logging.info(
+                        "Post-local SGD activated at global epoch %d with H=%d",
+                        global_epoch,
+                        self.local_steps,
+                    )
+
+    @torch.no_grad()
+    def sync_pending(self):
+        if self.pending_local_steps == 0:
+            return
+        if hvd.size() > 1:
+            parameters = [p.detach() for p in self.parameters if p.requires_grad]
+            hvd.grouped_allreduce_(parameters, op=hvd.Average, name="post_local_weights")
+            self.weight_sync_rounds += 1
+        self.pending_local_steps = 0
+
+    @torch.no_grad()
+    def sync_task_boundary(self):
+        self.sync_pending()
+        if self.local_active and self.model_buffers and hvd.size() > 1:
+            hvd.broadcast_parameters(self.model_buffers, root_rank=0)
+        if self.local_steps > 1 and hvd.rank() == 0:
+            logging.info(
+                "Cumulative optimizer synchronization rounds: gradients=%d, weights=%d",
+                self.gradient_sync_rounds,
+                self.weight_sync_rounds,
+            )
 
     def __getstate__(self):
         return {

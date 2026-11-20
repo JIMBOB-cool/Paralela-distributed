@@ -251,6 +251,10 @@ parser.add_argument(
     help="override params to retrieve nsys metrics on one epoch only",
 )
 parser.add_argument("--save-dir", metavar="SAVE_DIR", default="", help="saved folder")
+parser.add_argument("--local-steps", type=int, default=1,
+                    help="SGD updates per model average (1 keeps the original optimizer)")
+parser.add_argument("--local-start-epoch", type=int, default=1,
+                    help="zero-based global epoch at which local updates begin")
 
 
 def main():
@@ -276,6 +280,24 @@ def main():
                     if v:
                         params[k] = str(literal_eval(v) | literal_eval(yparam))
     args = Namespace(**params)
+    if args.local_steps < 1 or args.local_start_epoch < 0:
+        parser.error("local_steps must be positive and local_start_epoch nonnegative")
+    if args.local_steps > 1:
+        scenario = literal_eval(args.tasksets_config).get("scenario", "class")
+        if (
+            args.model != "Er"
+            or scenario == "reconstruction"
+            or args.use_amp
+            or args.batches_per_allreduce != 1
+            or args.fp16_allreduce
+            or args.use_adasum
+            or args.gradient_predivide_factor != 1.0
+            or args.load_checkpoint
+        ):
+            parser.error(
+                "Post-local SGD requires classification ER, no AMP, one backward "
+                "pass per step, uncompressed average reduction and a fresh run"
+            )
 
     # Nsys mode: train for one epoch only
     if args.nsys_run:
@@ -401,6 +423,8 @@ class Experiment:
             self.args.gradient_predivide_factor,
             optimizer_regime_dict,
             self.args.use_amp,
+            local_steps=self.args.local_steps,
+            local_start_epoch=self.args.local_start_epoch,
         )
 
         # -------------------------------------------------------------------------------------------------#

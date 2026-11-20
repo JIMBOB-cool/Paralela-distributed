@@ -293,6 +293,9 @@ def train(
                     }
                 )
 
+            if epoch + 1 == epochs[task_id]:
+                model.optimizer_regime.sync_task_boundary()
+
             # Evaluate the model on current and previous tasks
             before_evaluate_time = time.perf_counter()
             tasks_meters = []

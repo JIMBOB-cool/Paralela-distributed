@@ -100,6 +100,7 @@ class Er(ContinualLearner):
                 # If performing multiple passes, update the optimizer only once.
                 if i == 0:
                     self.optimizer_regime.update(step)
+                    self.optimizer_regime.set_local_phase(step["global_epoch"])
                     self.optimizer_regime.zero_grad()
 
                 # Forward pass
